@@ -902,16 +902,26 @@ impl FrameStruct for Datagram {
     const SIZE_BOUND: usize = 1 + 8;
 }
 
+/// Write the framing that precedes a DATAGRAM payload of `len` bytes.
+///
+/// Split out so a datagram assembled from several buffers can be framed without first
+/// concatenating them.
+pub(crate) fn encode_datagram_header(len: usize, length: bool, out: &mut Vec<u8>) {
+    out.write(FrameType(*DATAGRAM_TYS.start() | u64::from(length))); // 1 byte
+    if length {
+        // Safe to unwrap because we check length sanity before queueing datagrams
+        out.write(VarInt::from_u64(len as u64).unwrap()); // <= 8 bytes
+    }
+}
+
 impl Datagram {
+    #[cfg(test)]
     pub(crate) fn encode(&self, length: bool, out: &mut Vec<u8>) {
-        out.write(FrameType(*DATAGRAM_TYS.start() | u64::from(length))); // 1 byte
-        if length {
-            // Safe to unwrap because we check length sanity before queueing datagrams
-            out.write(VarInt::from_u64(self.data.len() as u64).unwrap()); // <= 8 bytes
-        }
+        encode_datagram_header(self.data.len(), length, out);
         out.extend_from_slice(&self.data);
     }
 
+    #[cfg(test)]
     pub(crate) fn size(&self, length: bool) -> usize {
         1 + if length {
             VarInt::from_u64(self.data.len() as u64).unwrap().size()
