@@ -480,10 +480,16 @@ impl EndpointInner {
         respond(transmit, &response_buffer, &mut state.sender);
     }
 
-    pub(crate) fn retry(&self, incoming: proto::Incoming) -> Result<(), proto::RetryError> {
+    pub(crate) fn retry(
+        &self,
+        incoming: proto::Incoming,
+        src_cid: Option<proto::ConnectionId>,
+    ) -> Result<(), proto::RetryError> {
         let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
-        let transmit = state.inner.retry(incoming, &mut response_buffer)?;
+        let transmit = state
+            .inner
+            .retry_with_cid(incoming, &mut response_buffer, src_cid)?;
         respond(transmit, &response_buffer, &mut state.sender);
         Ok(())
     }

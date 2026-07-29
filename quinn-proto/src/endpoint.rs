@@ -725,6 +725,29 @@ impl Endpoint {
     ///
     /// Errors if `incoming.may_retry()` is false.
     pub fn retry(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Result<Transmit, RetryError> {
+        self.retry_with_cid(incoming, buf, None)
+    }
+
+    /// Respond with a retry packet, choosing the source connection ID it carries
+    ///
+    /// The peer echoes this value as the destination connection ID of its following Initials
+    /// (RFC 9000 §17.2.5), so an application that steers packets by connection ID — for instance a
+    /// `SO_REUSEPORT` group whose sockets are selected by a BPF filter reading the CID — can use
+    /// it to direct the retried handshake to a socket of its choosing. That is the one decision a
+    /// stateless filter cannot make on its own, the first packet of a connection carrying a CID
+    /// picked by the *client*.
+    ///
+    /// `src_cid` must be [`ConnectionIdGenerator::cid_len`] bytes long; a value of the wrong length
+    /// is refused and the generator is used instead, since the peer's following packets would
+    /// otherwise fail to parse. `None` reproduces [`Endpoint::retry`] exactly.
+    ///
+    /// Errors if `may_retry()` is false.
+    pub fn retry_with_cid(
+        &mut self,
+        incoming: Incoming,
+        buf: &mut Vec<u8>,
+        src_cid: Option<ConnectionId>,
+    ) -> Result<Transmit, RetryError> {
         if !incoming.may_retry() {
             return Err(RetryError(Box::new(incoming)));
         }
@@ -740,7 +763,22 @@ impl Endpoint {
         // with established connections. In the unlikely event that a collision occurs
         // between two connections in the initial phase, both will fail fast and may be
         // retried by the application layer.
-        let loc_cid = self.local_cid_generator.generate_cid();
+        let loc_cid = match src_cid {
+            Some(cid) if cid.len() == self.local_cid_generator.cid_len() => cid,
+            Some(cid) => {
+                // Refused rather than truncated or padded: a CID of the wrong length would make
+                // every following packet of this connection unparseable by the endpoint that
+                // receives it, and the failure would look like a peer that gave up rather than
+                // like a caller mistake.
+                error!(
+                    "retry source CID is {} bytes, expected {}; using a generated one",
+                    cid.len(),
+                    self.local_cid_generator.cid_len()
+                );
+                self.local_cid_generator.generate_cid()
+            }
+            None => self.local_cid_generator.generate_cid(),
+        };
 
         let payload = TokenPayload::Retry {
             address: incoming.addresses.remote,
