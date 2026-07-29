@@ -58,15 +58,15 @@ impl Incoming {
     ///
     /// The peer echoes it as the destination connection ID of its following Initials, so an
     /// application that steers packets by connection ID can direct the retried handshake to a
-    /// socket of its choosing. See [`proto::Endpoint::retry_with_cid`].
+    /// socket of its choosing. See `proto::Endpoint::retry_with_cid`.
     ///
     /// Errors if `may_retry()` is false.
-    pub fn retry_to(mut self, src_cid: proto::ConnectionId) -> Result<(), RetryError> {
+    pub fn retry_to(mut self, src_cid: ConnectionId) -> Result<(), RetryError> {
         let state = self.0.take().unwrap();
         Self::do_retry(state, Some(src_cid))
     }
 
-    fn do_retry(state: State, src_cid: Option<proto::ConnectionId>) -> Result<(), RetryError> {
+    fn do_retry(state: State, src_cid: Option<ConnectionId>) -> Result<(), RetryError> {
         let endpoint = state.endpoint.clone();
         endpoint.retry(state.inner, src_cid).map_err(|e| {
             RetryError(Box::new(Self(Some(State {
