@@ -1108,7 +1108,13 @@ impl State {
         let max_datagrams = self
             .sender
             .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
+            .min(MAX_TRANSMIT_SEGMENTS)
+            // A GSO batch is a single UDP datagram to the kernel, so its total size is bounded by
+            // the IP length field. Exceeding it makes `sendmsg` fail with EMSGSIZE, which
+            // `quinn-udp` deliberately swallows as success (it is expected for MTU probes) — so the
+            // send is silently lost and congestion control reacts to the resulting loss.
+            .min(MAX_UDP_PAYLOAD / self.inner.current_mtu().max(1) as usize)
+            .max(1);
 
         loop {
             // Retry the last transmit, or get a new one.
@@ -1422,4 +1428,7 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// This can be lower than the maximum platform capabilities, to avoid excessive
 /// memory allocations when calling `poll_transmit()`. Benchmarks have shown
 /// that numbers around 10 are a good compromise.
-const MAX_TRANSMIT_SEGMENTS: usize = 10;
+const MAX_TRANSMIT_SEGMENTS: usize = 64;
+
+/// Largest UDP payload an IPv4 datagram can carry: 65535 minus the IP and UDP headers.
+const MAX_UDP_PAYLOAD: usize = 65535 - 20 - 8;
