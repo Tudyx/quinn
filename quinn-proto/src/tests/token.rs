@@ -1,6 +1,7 @@
 //! Tests specifically for tokens
 
 use super::*;
+use crate::endpoint::retry_src_cid;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -330,4 +331,40 @@ impl TimeSource for FakeTimeSource {
     fn now(&self) -> SystemTime {
         *self.0.lock().unwrap()
     }
+}
+
+/// RFC 9000 §17.2.5.1: the source CID of a Retry "MUST NOT be equal to the Destination Connection
+/// ID field of the packet sent by the client".
+///
+/// Asserted on the choice rather than on a handshake, because quinn's own client does not implement
+/// the matching discard rule of §17.2.5.2 — a handshake would therefore succeed whether the guard
+/// is here or not, and the test would freeze nothing.
+#[test]
+fn retry_src_cid_refuses_the_clients_destination_cid() {
+    let mut generator = RandomConnectionIdGenerator::new(8);
+    let client_dst_cid = ConnectionId::new(&[0xab; 8]);
+    let other = ConnectionId::new(&[0xcd; 8]);
+
+    // The forbidden value never comes back, whatever the generator produces.
+    for _ in 0..64 {
+        assert_ne!(
+            retry_src_cid(&mut generator, Some(client_dst_cid), client_dst_cid),
+            client_dst_cid,
+        );
+    }
+
+    // A CID of the wrong length is refused too, and the generator's length is what comes back.
+    let short = ConnectionId::new(&[0xef; 4]);
+    let chosen = retry_src_cid(&mut generator, Some(short), client_dst_cid);
+    assert_ne!(chosen, short);
+    assert_eq!(chosen.len(), 8);
+
+    // Anything else is honoured exactly: that is the whole point of the API.
+    assert_eq!(
+        retry_src_cid(&mut generator, Some(other), client_dst_cid),
+        other
+    );
+
+    // And `None` still defers to the generator.
+    assert_eq!(retry_src_cid(&mut generator, None, client_dst_cid).len(), 8);
 }

@@ -725,6 +725,29 @@ impl Endpoint {
     ///
     /// Errors if `incoming.may_retry()` is false.
     pub fn retry(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Result<Transmit, RetryError> {
+        self.retry_with_cid(incoming, buf, None)
+    }
+
+    /// Respond with a retry packet, choosing the source connection ID it carries
+    ///
+    /// The peer echoes this value as the destination connection ID of its following Initials
+    /// (RFC 9000 §17.2.5), so an application that steers packets by connection ID — for instance a
+    /// `SO_REUSEPORT` group whose sockets are selected by a BPF filter reading the CID — can use
+    /// it to direct the retried handshake to a socket of its choosing. That is the one decision a
+    /// stateless filter cannot make on its own, the first packet of a connection carrying a CID
+    /// picked by the *client*.
+    ///
+    /// `src_cid` must be [`ConnectionIdGenerator::cid_len`] bytes long; a value of the wrong length
+    /// is refused and the generator is used instead, since the peer's following packets would
+    /// otherwise fail to parse. `None` reproduces [`Endpoint::retry`] exactly.
+    ///
+    /// Errors if `may_retry()` is false.
+    pub fn retry_with_cid(
+        &mut self,
+        incoming: Incoming,
+        buf: &mut Vec<u8>,
+        src_cid: Option<ConnectionId>,
+    ) -> Result<Transmit, RetryError> {
         if !incoming.may_retry() {
             return Err(RetryError(Box::new(incoming)));
         }
@@ -740,7 +763,11 @@ impl Endpoint {
         // with established connections. In the unlikely event that a collision occurs
         // between two connections in the initial phase, both will fail fast and may be
         // retried by the application layer.
-        let loc_cid = self.local_cid_generator.generate_cid();
+        let loc_cid = retry_src_cid(
+            &mut *self.local_cid_generator,
+            src_cid,
+            incoming.packet.header.dst_cid,
+        );
 
         let payload = TokenPayload::Retry {
             address: incoming.addresses.remote,
@@ -951,6 +978,40 @@ impl Endpoint {
         let len = self.index.connection_ids.len() as u64;
 
         len > (space - reserve)
+    }
+}
+
+/// Picks the source connection ID a Retry will carry, honouring `requested` where it can.
+///
+/// Two values are refused, and the generator decides instead. A CID equal to the destination
+/// connection ID of the client's Initial is forbidden by RFC 9000 §17.2.5.1 — a conforming client
+/// discards such a Retry, so the handshake stalls to a timeout rather than failing. A CID of a
+/// length other than the generator's would make every following packet of this connection
+/// unparseable by the endpoint receiving it. Both are logged rather than substituted in silence,
+/// which would defeat the steering the caller asked for without saying so.
+pub(crate) fn retry_src_cid(
+    generator: &mut dyn ConnectionIdGenerator,
+    requested: Option<ConnectionId>,
+    client_dst_cid: ConnectionId,
+) -> ConnectionId {
+    match requested {
+        Some(cid) if cid == client_dst_cid => {
+            error!(
+                "retry source CID equals the client's destination CID, forbidden by RFC 9000 \
+                 §17.2.5.1; using a generated one"
+            );
+            generator.generate_cid()
+        }
+        Some(cid) if cid.len() != generator.cid_len() => {
+            error!(
+                "retry source CID is {} bytes, expected {}; using a generated one",
+                cid.len(),
+                generator.cid_len()
+            );
+            generator.generate_cid()
+        }
+        Some(cid) => cid,
+        None => generator.generate_cid(),
     }
 }
 
