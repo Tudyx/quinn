@@ -933,6 +933,22 @@ impl RecvState {
                 Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
                     continue;
                 }
+                // Ignore ECONNREFUSED for exactly the same reason.
+                //
+                // On Linux it is how an ICMP port unreachable is surfaced on an *unconnected* UDP
+                // socket, because quinn-udp sets IP_RECVERR for path MTU discovery. Any peer that
+                // goes away leaves its ephemeral port closed, so a server still sending to it — an
+                // ACK, a close frame — gets one back. Like ECONNRESET it is unauthenticated and can
+                // be injected by an off-path attacker, and unlike a genuine socket failure it says
+                // nothing about *this* endpoint's ability to keep serving its other connections.
+                //
+                // Treating it as fatal kills the endpoint driver, so `accept()` starts returning
+                // `None` and every live connection fails with "endpoint driver future was dropped".
+                // Measured on a load-generator bench: a server lost its whole endpoint on the third
+                // round of clients connecting and disconnecting.
+                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    continue;
+                }
                 // Ignore EMSGSIZE as we're currently not handling ICMPv4 Fragmentation Needed
                 // and ICMPv6 Packet Too Big (PTB) messages since they cannot be authenticated,
                 // and Datagram Packetization Layer Path MTU Discovery (DPLPMTUD) works without
