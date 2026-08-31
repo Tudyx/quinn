@@ -97,8 +97,8 @@ impl Datagrams<'_> {
 
 #[derive(Default)]
 pub(super) struct DatagramState {
-    pub(super) incoming: DatagramBuffer,
-    pub(super) outgoing: DatagramBuffer,
+    pub(super) incoming: DatagramBuffer<Datagram>,
+    pub(super) outgoing: DatagramBuffer<Datagram>,
     pub(super) send_blocked: bool,
 }
 
@@ -138,7 +138,7 @@ impl DatagramState {
             let Some(prev) = self.outgoing.pop_front() else {
                 break;
             };
-            trace!(len = prev.data.len(), "dropping outgoing datagram");
+            trace!(len = prev.payload_len(), "dropping outgoing datagram");
         }
     }
 
@@ -159,14 +159,14 @@ impl DatagramState {
     pub(super) fn drop_oversized(&mut self, max_payload: usize) -> bool {
         let mut dropped_any = false;
         self.outgoing.queue.retain(|datagram| {
-            let result = datagram.data.len() < max_payload;
+            let result = datagram.payload_len() < max_payload;
             if !result {
                 trace!(
                     "dropping {} byte datagram violating {} byte limit",
-                    datagram.data.len(),
+                    datagram.payload_len(),
                     max_payload
                 );
-                self.outgoing.payload_bytes -= datagram.data.len();
+                self.outgoing.payload_bytes -= datagram.payload_len();
                 dropped_any = true;
             }
             result
@@ -190,7 +190,7 @@ impl DatagramState {
             return false;
         }
 
-        trace!(len = datagram.data.len(), "DATAGRAM");
+        trace!(len = datagram.payload_len(), "DATAGRAM");
         datagram.encode(true, buf);
         true
     }
@@ -201,32 +201,70 @@ impl DatagramState {
     }
 }
 
-#[derive(Default)]
-pub(super) struct DatagramBuffer {
-    queue: VecDeque<Datagram>,
+/// What a queued datagram has to answer for the buffer to bill it and put it on the wire.
+///
+/// The buffer charges `size_of` its element against the configured budget, so an element that
+/// carries more than a payload is billed for it rather than exceeding the budget silently.
+pub(super) trait QueuedDatagram {
+    /// Payload length, framing excluded.
+    fn payload_len(&self) -> usize;
+
+    /// Length once framed, `length` telling whether the frame carries an explicit length field.
+    fn size(&self, length: bool) -> usize;
+
+    /// Append the frame — header, then payload — to `out`.
+    fn encode(&self, length: bool, out: &mut Vec<u8>);
+}
+
+impl QueuedDatagram for Datagram {
+    fn payload_len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn size(&self, length: bool) -> usize {
+        Self::size(self, length)
+    }
+
+    fn encode(&self, length: bool, out: &mut Vec<u8>) {
+        Self::encode(self, length, out)
+    }
+}
+
+pub(super) struct DatagramBuffer<T> {
+    queue: VecDeque<T>,
     payload_bytes: usize,
 }
 
-impl DatagramBuffer {
-    fn push_back(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
+/// Hand-written so an empty buffer needs nothing of its element.
+impl<T> Default for DatagramBuffer<T> {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            payload_bytes: 0,
+        }
+    }
+}
+
+impl<T: QueuedDatagram> DatagramBuffer<T> {
+    fn push_back(&mut self, datagram: T) {
+        self.payload_bytes += datagram.payload_len();
         self.queue.push_back(datagram);
     }
 
-    fn pop_front(&mut self) -> Option<Datagram> {
+    fn pop_front(&mut self) -> Option<T> {
         let datagram = self.queue.pop_front()?;
-        self.payload_bytes -= datagram.data.len();
+        self.payload_bytes -= datagram.payload_len();
         Some(datagram)
     }
 
-    fn push_front(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
+    fn push_front(&mut self, datagram: T) {
+        self.payload_bytes += datagram.payload_len();
         self.queue.push_front(datagram);
     }
 
     fn memory_used(&self) -> usize {
         self.payload_bytes
-            .saturating_add(self.queue.len() * size_of::<Datagram>())
+            .saturating_add(self.queue.len() * size_of::<T>())
     }
 
     pub(super) fn can_send_1rtt(&self, max_size: usize) -> bool {
