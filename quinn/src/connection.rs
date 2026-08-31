@@ -497,6 +497,39 @@ impl Connection {
         }
     }
 
+    /// Transmit `parts` as an unreliable, unordered application datagram, without concatenating them
+    ///
+    /// The scatter-gather counterpart of [`send_datagram`](Self::send_datagram), for callers that
+    /// hold a payload and prepend a header they generate — the shape of every encapsulating
+    /// protocol. Passing the parts separately saves a copy of the whole payload: they are gathered
+    /// directly into the packet buffer, which is where a concatenated buffer would have been copied
+    /// anyway.
+    ///
+    /// Like `send_datagram`, this may discard older queued datagrams to make room, and so never
+    /// blocks. There is no counterpart to [`send_datagram_wait`](Self::send_datagram_wait) yet.
+    pub fn send_datagram_parts(
+        &self,
+        parts: impl IntoIterator<Item = Bytes>,
+    ) -> Result<(), SendDatagramError> {
+        let conn = &mut *self.0.state.lock("send_datagram_parts");
+        if let Some(ref x) = conn.error {
+            return Err(SendDatagramError::ConnectionLost(x.clone()));
+        }
+        use proto::SendDatagramError::*;
+        match conn.inner.datagrams().send_parts(parts) {
+            Ok(()) => {
+                conn.wake();
+                Ok(())
+            }
+            Err(e) => Err(match e {
+                Blocked(..) => unreachable!(),
+                UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
+                Disabled => SendDatagramError::Disabled,
+                TooLarge => SendDatagramError::TooLarge,
+            }),
+        }
+    }
+
     /// Transmit `data` as an unreliable, unordered application datagram
     ///
     /// Unlike [`send_datagram()`], this method will wait for buffer space during congestion

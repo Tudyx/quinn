@@ -48,6 +48,8 @@ use cid_state::CidState;
 
 mod datagrams;
 use datagrams::DatagramState;
+#[cfg(test)]
+pub(crate) use datagrams::OutgoingDatagram;
 pub use datagrams::{Datagrams, SendDatagramError};
 
 mod mtud;

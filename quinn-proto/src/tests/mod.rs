@@ -28,6 +28,7 @@ use super::*;
 use crate::{
     Duration, Instant,
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
+    connection::OutgoingDatagram,
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     packet::{Header, InitialHeader, PacketNumber},
@@ -3721,7 +3722,7 @@ fn oversized_datagrams_trigger_unblock() {
 
     assert_eq!(
         pair.client_datagrams(client_ch).send_buffer_space(),
-        send_buffer_size - size_of::<Datagram>(),
+        send_buffer_size - size_of::<OutgoingDatagram>(),
         "expected the send buffer to be empty after too large datagrams were dropped",
     );
     match pair.client_conn_mut(client_ch).poll() {

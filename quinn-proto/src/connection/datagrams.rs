@@ -2,12 +2,13 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use thiserror::Error;
+use tinyvec::TinyVec;
 use tracing::{debug, trace};
 
 use super::Connection;
 use crate::{
-    TransportError,
-    frame::{Datagram, FrameStruct},
+    TransportError, VarInt,
+    frame::{Datagram, FrameStruct, encode_datagram_header},
 };
 
 /// API to control datagram traffic
@@ -48,7 +49,44 @@ impl Datagrams<'_> {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        self.conn
+            .datagrams
+            .outgoing
+            .push_back(OutgoingDatagram::new([data]));
+        Ok(())
+    }
+
+    /// Queue a datagram assembled from several buffers, without concatenating them
+    ///
+    /// The scatter-gather counterpart of [`send`](Self::send), for callers that hold a payload and
+    /// prepend a header they generate — the shape of every encapsulating protocol. Passing the two
+    /// separately saves a copy of the whole payload, since the parts are gathered directly into the
+    /// packet buffer.
+    ///
+    /// Behaves as `send` with `drop` set: previously queued datagrams which are still unsent may be
+    /// discarded to make space, oldest first, so this never reports `Blocked`. There is no waiting
+    /// counterpart yet, as [`SendDatagramError::Blocked`] can only carry a single buffer back.
+    pub fn send_parts(
+        &mut self,
+        parts: impl IntoIterator<Item = Bytes>,
+    ) -> Result<(), SendDatagramError> {
+        if self.conn.config.datagram_receive_buffer_size.is_none() {
+            return Err(SendDatagramError::Disabled);
+        }
+        let max = self
+            .max_size()
+            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+        let send_buffer_size = self.conn.config.datagram_send_buffer_size;
+
+        let datagram = OutgoingDatagram::new(parts);
+        if datagram.len > Ord::min(max, send_buffer_size) {
+            return Err(SendDatagramError::TooLarge);
+        }
+
+        self.conn
+            .datagrams
+            .make_space_for(datagram.len, send_buffer_size);
+        self.conn.datagrams.outgoing.push_back(datagram);
         Ok(())
     }
 
@@ -91,14 +129,14 @@ impl Datagrams<'_> {
             .config
             .datagram_send_buffer_size
             .saturating_sub(self.conn.datagrams.outgoing.payload_bytes)
-            .saturating_sub(size_of::<Datagram>())
+            .saturating_sub(size_of::<OutgoingDatagram>())
     }
 }
 
 #[derive(Default)]
 pub(super) struct DatagramState {
     pub(super) incoming: DatagramBuffer<Datagram>,
-    pub(super) outgoing: DatagramBuffer<Datagram>,
+    pub(super) outgoing: DatagramBuffer<OutgoingDatagram>,
     pub(super) send_blocked: bool,
 }
 
@@ -203,8 +241,9 @@ impl DatagramState {
 
 /// What a queued datagram has to answer for the buffer to bill it and put it on the wire.
 ///
-/// The buffer charges `size_of` its element against the configured budget, so an element that
-/// carries more than a payload is billed for it rather than exceeding the budget silently.
+/// The two queues do not hold the same thing — incoming datagrams arrive contiguous, outgoing ones
+/// may be assembled from several buffers — but they are billed and framed identically, so the
+/// buffer is generic over which and each direction is charged its own element size.
 pub(super) trait QueuedDatagram {
     /// Payload length, framing excluded.
     fn payload_len(&self) -> usize;
@@ -227,6 +266,53 @@ impl QueuedDatagram for Datagram {
 
     fn encode(&self, length: bool, out: &mut Vec<u8>) {
         Self::encode(self, length, out)
+    }
+}
+
+/// A datagram queued for transmission, possibly assembled from several buffers.
+///
+/// Callers that build a datagram from a header they generate and a payload they already hold —
+/// tunnels and encapsulating protocols do this for every packet — would otherwise have to
+/// concatenate the two into a fresh allocation, copying the payload once for nothing: the payload
+/// is copied again into the packet buffer a moment later, and that second copy could just as well
+/// have gathered the parts.
+///
+/// Two inline slots cover that case without allocating. They are what makes this element larger
+/// than a `Datagram`, and `DatagramBuffer` charges that difference to the send buffer rather than
+/// hiding it.
+#[derive(Default)]
+pub(crate) struct OutgoingDatagram {
+    parts: TinyVec<[Bytes; 2]>,
+    /// Total payload length, cached because it is consulted far more often than the parts.
+    len: usize,
+}
+
+impl OutgoingDatagram {
+    fn new(parts: impl IntoIterator<Item = Bytes>) -> Self {
+        let parts: TinyVec<[Bytes; 2]> = parts.into_iter().filter(|p| !p.is_empty()).collect();
+        let len = parts.iter().map(|p| p.len()).sum();
+        Self { parts, len }
+    }
+}
+
+impl QueuedDatagram for OutgoingDatagram {
+    fn payload_len(&self) -> usize {
+        self.len
+    }
+
+    fn size(&self, length: bool) -> usize {
+        1 + if length {
+            VarInt::from_u64(self.len as u64).unwrap().size()
+        } else {
+            0
+        } + self.len
+    }
+
+    fn encode(&self, length: bool, out: &mut Vec<u8>) {
+        encode_datagram_header(self.len, length, out);
+        for part in &self.parts {
+            out.extend_from_slice(part);
+        }
     }
 }
 
@@ -280,29 +366,61 @@ impl<T: QueuedDatagram> DatagramBuffer<T> {
 mod tests {
     use super::*;
 
+    /// What has to hold of a scatter-gather send: the packet produced is **exactly** the one a
+    /// prior concatenation would have produced. That is the only guarantee the caller can observe,
+    /// hence the only one to test.
+    #[test]
+    fn parts_encode_as_the_concatenation() {
+        let parts = [
+            Bytes::from_static(b"generated-header"),
+            Bytes::from_static(b"payload already in memory"),
+        ];
+        let concatenated: Vec<u8> = parts.iter().flatten().copied().collect();
+
+        for length in [false, true] {
+            let mut a = Vec::new();
+            OutgoingDatagram::new(parts.clone()).encode(length, &mut a);
+
+            let mut b = Vec::new();
+            OutgoingDatagram::new([Bytes::from(concatenated.clone())]).encode(length, &mut b);
+
+            assert_eq!(a, b, "encoding diverges with length={length}");
+        }
+    }
+
+    /// An empty part must not take a slot: otherwise two equivalent calls would not allocate alike,
+    /// and the common case — header plus payload — would spill out of the two inline slots.
+    #[test]
+    fn empty_parts_are_discarded() {
+        let d = OutgoingDatagram::new([Bytes::new(), Bytes::from_static(b"useful"), Bytes::new()]);
+        assert_eq!(d.parts.len(), 1);
+        assert_eq!(d.len, 6);
+    }
+
     #[test]
     fn make_space_for_accounts_for_new_datagram() {
         let mut state = DatagramState::default();
-        state.outgoing.push_back(Datagram {
-            data: Bytes::from_static(&[0; 7]),
-        });
-        state.outgoing.push_back(Datagram {
-            data: Bytes::from_static(&[0; 2]),
-        });
+        state
+            .outgoing
+            .push_back(OutgoingDatagram::new([Bytes::from_static(&[0; 7])]));
+        state
+            .outgoing
+            .push_back(OutgoingDatagram::new([Bytes::from_static(&[0; 2])]));
 
-        state.make_space_for(4, 10 + 2 * size_of::<Datagram>());
+        state.make_space_for(4, 10 + 2 * size_of::<OutgoingDatagram>());
 
         assert_eq!(state.outgoing.queue.len(), 1);
-        assert_eq!(state.outgoing.queue[0].data.len(), 2);
+        assert_eq!(state.outgoing.queue[0].len, 2);
         assert_eq!(state.outgoing.payload_bytes, 2);
     }
 
     #[test]
     fn make_space_for_handles_overflowing_capacity_check() {
         let mut state = DatagramState::default();
-        state.outgoing.queue.push_back(Datagram {
-            data: Bytes::from_static(&[0]),
-        });
+        state
+            .outgoing
+            .queue
+            .push_back(OutgoingDatagram::new([Bytes::from_static(&[0])]));
         state.outgoing.payload_bytes = usize::MAX - 1;
 
         state.make_space_for(2, usize::MAX);
