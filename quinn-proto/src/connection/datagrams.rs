@@ -124,12 +124,17 @@ impl Datagrams<'_> {
     ///
     /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
     /// guaranteed not to cause older datagrams to be dropped.
+    ///
+    /// The subtrahend is [`DatagramBuffer::memory_used`], the very quantity
+    /// [`DatagramState::has_send_buffer_space`] compares against, so the guarantee above holds
+    /// entry for entry: the queue charges one element's overhead **per queued entry**, and an
+    /// accessor subtracting a single one over-reported the free space by
+    /// `(len - 1) * size_of::<OutgoingDatagram>()`. At a 64 KiB queue of 1.3 kB datagrams that is
+    /// some 3.8 kB of room reported at the exact moment every push evicts.
     pub fn send_buffer_space(&self) -> usize {
         self.conn
-            .config
-            .datagram_send_buffer_size
-            .saturating_sub(self.conn.datagrams.outgoing.payload_bytes)
-            .saturating_sub(size_of::<OutgoingDatagram>())
+            .datagrams
+            .send_buffer_space(self.conn.config.datagram_send_buffer_size)
     }
 }
 
@@ -178,6 +183,12 @@ impl DatagramState {
             };
             trace!(len = prev.payload_len(), "dropping outgoing datagram");
         }
+    }
+
+    /// Room left before [`Self::has_send_buffer_space`] starts refusing — the accessor's half of
+    /// the contract, kept beside the eviction's half so the two cannot be derived apart.
+    fn send_buffer_space(&self, send_buffer_size: usize) -> usize {
+        send_buffer_size.saturating_sub(self.outgoing.memory_used())
     }
 
     fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
@@ -427,6 +438,45 @@ mod tests {
 
         assert!(state.outgoing.is_empty());
         assert_eq!(state.outgoing.payload_bytes, usize::MAX - 2);
+    }
+
+    /// **The accessor and the eviction are two halves of one contract**, and they only have to be
+    /// confronted at a queue holding **many** entries. `memory_used()` charges one element's
+    /// overhead per queued entry; an accessor subtracting a single one over-reports the free space
+    /// by `(len - 1) * size_of::<OutgoingDatagram>()`, so at a 64 KiB queue of 1.3 kB datagrams it
+    /// announced some 3.8 kB of room at the exact moment every push evicted an older datagram. At a
+    /// queue that holds one entry the two arithmetics agree to one element and the defect is
+    /// invisible — which is why the case pinned here is the many-entry one.
+    #[test]
+    fn a_full_queue_of_many_entries_reports_no_room_before_it_evicts() {
+        const SIZE: usize = 1318;
+        const BUFFER: usize = 65_536;
+
+        let mut state = DatagramState::default();
+        let mut queued = 0;
+        while state.has_send_buffer_space(SIZE, BUFFER) {
+            // The doc comment's guarantee, asserted at every depth rather than only at the end:
+            // whatever the accessor announces must be a size the eviction would accept.
+            let announced = state.send_buffer_space(BUFFER);
+            assert!(
+                state.has_send_buffer_space(announced, BUFFER),
+                "{announced} bytes announced free with {queued} entries queued, and a datagram of \
+                 that size would evict"
+            );
+            state
+                .outgoing
+                .push_back(OutgoingDatagram::new([Bytes::from_static(&[0; SIZE])]));
+            queued += 1;
+        }
+
+        assert!(
+            queued > 10,
+            "{queued} entries fit: this is the single-entry regime, where the defect is invisible"
+        );
+        assert!(
+            state.send_buffer_space(BUFFER) < SIZE,
+            "the queue is full and the accessor still offers room for another datagram"
+        );
     }
 
     #[test]
