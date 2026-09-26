@@ -2191,6 +2191,18 @@ fn datagram_recv_buffer_overflow() {
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA2);
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA3);
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+    // DATA1 was the one evicted, and the stats say so on the side that evicted it alone
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .datagram_drops
+            .evicted_unread,
+        1
+    );
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().datagram_drops,
+        crate::DatagramDropStats::default()
+    );
 
     pair.client_datagrams(client_ch)
         .send(DATA1.into(), true)

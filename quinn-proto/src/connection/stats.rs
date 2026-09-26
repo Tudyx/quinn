@@ -163,6 +163,22 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+/// Unreliable datagrams quinn discarded without the application being told
+///
+/// Every one of these is a datagram that an `Ok` accepted or that reached the connection, and that
+/// then disappeared with nothing but a log line: without them the loss is visible only as a gap
+/// between two counters the application keeps itself, and cannot be attributed.
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DatagramDropStats {
+    /// Outgoing datagrams evicted unsent, oldest first, to make room for a newer one
+    pub evicted_unsent: u64,
+    /// Outgoing datagrams discarded unsent because the path MTU shrank below their size
+    pub oversized_unsent: u64,
+    /// Received datagrams evicted unread, oldest first, when the receive buffer overflowed
+    pub evicted_unread: u64,
+}
+
 /// Connection statistics
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
@@ -177,4 +193,6 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// Unreliable datagrams discarded at either end of the datagram queues
+    pub datagram_drops: DatagramDropStats,
 }

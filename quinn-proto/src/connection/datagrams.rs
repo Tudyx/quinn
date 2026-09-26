@@ -5,7 +5,7 @@ use thiserror::Error;
 use tinyvec::TinyVec;
 use tracing::{debug, trace};
 
-use super::Connection;
+use super::{Connection, DatagramDropStats};
 use crate::{
     TransportError, VarInt,
     frame::{Datagram, FrameStruct, encode_datagram_header},
@@ -143,6 +143,9 @@ pub(super) struct DatagramState {
     pub(super) incoming: DatagramBuffer<Datagram>,
     pub(super) outgoing: DatagramBuffer<OutgoingDatagram>,
     pub(super) send_blocked: bool,
+    /// Kept here rather than in the connection's stats because every drop site is a method of this
+    /// type, and copied out by `Connection::stats`
+    pub(super) drops: DatagramDropStats,
 }
 
 impl DatagramState {
@@ -170,6 +173,7 @@ impl DatagramState {
         while self.incoming.memory_used() + size_with_overhead > window {
             debug!("dropping stale datagram");
             self.recv();
+            self.drops.evicted_unread += 1;
         }
 
         self.incoming.push_back(datagram);
@@ -182,6 +186,7 @@ impl DatagramState {
                 break;
             };
             trace!(len = prev.payload_len(), "dropping outgoing datagram");
+            self.drops.evicted_unsent += 1;
         }
     }
 
@@ -216,6 +221,7 @@ impl DatagramState {
                     max_payload
                 );
                 self.outgoing.payload_bytes -= datagram.payload_len();
+                self.drops.oversized_unsent += 1;
                 dropped_any = true;
             }
             result
@@ -477,6 +483,61 @@ mod tests {
             state.send_buffer_space(BUFFER) < SIZE,
             "the queue is full and the accessor still offers room for another datagram"
         );
+    }
+
+    /// Every datagram the eviction takes is one the counter adds, and nothing else moves it: the
+    /// count is what an application compares against its own accepted sends.
+    #[test]
+    fn eviction_counts_each_unsent_datagram_it_discards() {
+        let mut state = DatagramState::default();
+        for _ in 0..3 {
+            state
+                .outgoing
+                .push_back(OutgoingDatagram::new([Bytes::from_static(&[0; 7])]));
+        }
+
+        state.make_space_for(7, 7 + size_of::<OutgoingDatagram>());
+
+        assert_eq!(state.outgoing.queue.len(), 0);
+        assert_eq!(state.drops.evicted_unsent, 3);
+        assert_eq!(state.drops.evicted_unread, 0);
+        assert_eq!(state.drops.oversized_unsent, 0);
+    }
+
+    #[test]
+    fn a_shrunk_mtu_counts_each_oversized_datagram_it_discards() {
+        let mut state = DatagramState::default();
+        for len in [4, 9, 12] {
+            state
+                .outgoing
+                .push_back(OutgoingDatagram::new([Bytes::from(vec![0; len])]));
+        }
+
+        assert!(state.drop_oversized(9));
+
+        assert_eq!(state.outgoing.queue.len(), 1);
+        assert_eq!(state.drops.oversized_unsent, 2);
+        assert_eq!(state.drops.evicted_unsent, 0);
+    }
+
+    /// The receive side: `n` datagrams into a window that holds `fit` leaves `fit` queued and
+    /// counts the other `n - fit`, so a reader that drained nothing sees received = read + evicted.
+    #[test]
+    fn a_full_receive_buffer_counts_each_unread_datagram_it_evicts() {
+        const N: u64 = 10;
+        let datagram = Datagram {
+            data: Bytes::from_static(&[0; 100]),
+        };
+        let window = 3 * (100 + size_of::<Datagram>());
+
+        let mut state = DatagramState::default();
+        for _ in 0..N {
+            state.received(datagram.clone(), &Some(window)).unwrap();
+        }
+
+        assert_eq!(state.incoming.queue.len(), 3);
+        assert_eq!(state.drops.evicted_unread, N - 3);
+        assert_eq!(state.drops.evicted_unsent, 0);
     }
 
     #[test]
